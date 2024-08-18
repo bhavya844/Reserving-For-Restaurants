@@ -1,0 +1,446 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: "CloudFormation for Restaurant seat booking using AWS Lambda, DynamoDB, HTTP API Gateway, SQS, SNS and EC2 Instance."
+
+Parameters:
+  InstanceType:
+    Description: EC2 instance type
+    Type: String
+    Default: t2.micro
+    AllowedValues:
+      - t2.micro
+      - t2.small
+      - t2.medium
+      - m3.medium
+      - m3.large
+    ConstraintDescription: Must be a valid EC2 instance type.
+
+Resources:
+  RestaurantTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: Restaurant
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 10
+        WriteCapacityUnits: 10
+
+  ReservationsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: Reservations
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: email
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:   
+        - IndexName: email-index  
+          KeySchema:
+            - AttributeName: email
+              KeyType: HASH       
+          Projection:
+            ProjectionType: ALL   
+          ProvisionedThroughput:  
+            ReadCapacityUnits: 5
+            WriteCapacityUnits: 5
+      ProvisionedThroughput:
+        ReadCapacityUnits: 10
+        WriteCapacityUnits: 10
+
+  GetAllRestaurantsLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: GetAllRestaurantsLambda
+      Runtime: python3.8
+      Role: arn:aws:iam::970200206506:role/LabRole
+      Handler: index.handler
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from decimal import Decimal
+
+          def handler(event, context):
+              dynamodb = boto3.resource('dynamodb')
+              table = dynamodb.Table('Restaurant')
+              response = table.scan()
+              items = response['Items']
+              
+              while 'LastEvaluatedKey' in response:
+                  response = table.scan(ExclusiveStartKey=response['LastEvaluatedKey'])
+                  items.extend(response['Items'])
+              
+              # Convert items to a JSON-serializable format
+              serialized_items = json.dumps(items, default=decimal_to_float)
+              
+              return {
+                  'statusCode': 200,
+                  'headers': {
+                      'Content-Type': 'application/json'
+                  },
+                  'body': serialized_items
+              }
+
+          def decimal_to_float(obj):
+              """
+              Helper function to convert Decimal objects to float.
+              """
+              if isinstance(obj, Decimal):
+                  return float(obj)
+              raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
+
+  GetAllRestaurantsLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GetAllRestaurantsLambda
+      Action: "lambda:InvokeFunction"
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestaurantApi}/*/GET/all-restaurants"
+
+  RestaurantApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: RestaurantHttpApi
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins:
+          - "*"
+        AllowMethods:
+          - "*"
+        AllowHeaders:
+          - "*"
+        MaxAge: 86400 
+        AllowCredentials: False
+
+  GetAllRestaurantsIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref RestaurantApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetAllRestaurantsLambda.Arn}/invocations"
+      PayloadFormatVersion: "2.0"
+
+  GetAllRestaurantsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref RestaurantApi
+      RouteKey: "GET /all-restaurants"
+      Target: !Sub "integrations/${GetAllRestaurantsIntegration}"
+
+  RestaurantApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref RestaurantApi
+      StageName: "$default"
+      AutoDeploy: true
+
+  GetRestaurantByIdLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: GetRestaurantByIdLambda
+      Runtime: python3.8
+      Role: arn:aws:iam::970200206506:role/LabRole
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from decimal import Decimal
+
+          def lambda_handler(event, context):
+              dynamodb = boto3.resource('dynamodb')
+              table = dynamodb.Table('Restaurant')
+              print('event', event)
+
+              # Extract the 'id' from the path parameters
+              restaurant_id = event['pathParameters']['id']
+
+              try:
+                  # Query DynamoDB for the item with the specific ID
+                  response = table.get_item(Key={'id': restaurant_id})
+
+                  # Check if the item was found
+                  if 'Item' in response:
+                      item = response['Item']
+                      # Convert the item to a JSON-serializable format
+                      serialized_item = json.dumps(item, default=decimal_to_float)
+
+                      return {
+                          'statusCode': 200,
+                          'headers': {
+                              'Content-Type': 'application/json'
+                          },
+                          'body': serialized_item
+                      }
+                  else:
+                      # If no item is found, return a 404 response
+                      return {
+                          'statusCode': 404,
+                          'headers': {
+                              'Content-Type': 'application/json'
+                          },
+                          'body': json.dumps({'message': 'Restaurant not found'})
+                      }
+              except Exception as e:
+                  # Return a 500 response for any errors
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Content-Type': 'application/json'
+                      },
+                      'body': json.dumps({'message': 'Internal server error', 'error': str(e)})
+                  }
+
+          def decimal_to_float(obj):
+              """
+              Helper function to convert Decimal objects to float.
+              """
+              if isinstance(obj, Decimal):
+                  return float(obj)
+              raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
+
+  GetRestaurantByIdLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GetRestaurantByIdLambda
+      Action: "lambda:InvokeFunction"
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestaurantApi}/*/GET/all-restaurants/*"
+
+  GetRestaurantByIdIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref RestaurantApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetRestaurantByIdLambda.Arn}/invocations"
+      PayloadFormatVersion: "2.0"
+
+  GetRestaurantByIdRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref RestaurantApi
+      RouteKey: "GET /all-restaurants/{id}"
+      Target: !Sub "integrations/${GetRestaurantByIdIntegration}"
+
+
+  # Define the first SQS Queue
+  ReservationQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: RestaurantReservationQueue
+
+  # Define the second SQS Queue
+  StoreQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: StoreQueue
+
+  # Lambda to send messages to both the queues
+  ConfirmReservationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ConfirmReservationLambda
+      Runtime: nodejs18.x  
+      Role: arn:aws:iam::970200206506:role/LabRole
+      Handler: index.handler
+      Code:
+        S3Bucket: storedataindynamodb
+        S3Key: confirmreservationlambda.zip
+      Environment:
+        Variables:
+          QueueUrl: !Ref ReservationQueue
+          SecondQueueUrl: !Ref StoreQueue
+
+  ConfirmReservationLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ConfirmReservationLambda.Arn
+      Action: "lambda:InvokeFunction"
+      Principal: "apigateway.amazonaws.com"
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestaurantApi}/*/POST/reservations"
+
+  ConfirmReservationIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref RestaurantApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ConfirmReservationLambda.Arn
+      PayloadFormatVersion: "2.0"
+      IntegrationMethod: POST
+
+  ConfirmReservationRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref RestaurantApi
+      RouteKey: "POST /reservations"
+      Target: !Sub "integrations/${ConfirmReservationIntegration}"
+
+  # Lambda function to process reservation queue messages
+  ProcessReservationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ProcessReservationLambda
+      Runtime: nodejs20.x  
+      Role: arn:aws:iam::970200206506:role/LabRole
+      Handler: index.handler
+      Code:
+        S3Bucket: storedataindynamodb
+        S3Key: processreservationlambda.zip
+      Environment:
+        Variables:
+          QueueUrl: !Ref ReservationQueue
+          SnsTopicArn: !Ref ReservationSNSTopic
+
+  ProcessReservationLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ProcessReservationLambda.Arn
+      Action: "lambda:InvokeFunction"
+      Principal: "sqs.amazonaws.com"
+      SourceArn: !GetAtt ReservationQueue.Arn
+
+  ProcessReservationLambdaEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 10
+      EventSourceArn: !GetAtt ReservationQueue.Arn
+      FunctionName: !GetAtt ProcessReservationLambda.Arn
+      Enabled: true
+
+  # Lambda function to store data into DynamoDB
+  StoreToDynamoLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: StoreToDynamoLambda
+      Runtime: nodejs20.x
+      Role: arn:aws:iam::970200206506:role/LabRole
+      Handler: index.handler
+      Code:
+        S3Bucket: storedataindynamodb
+        S3Key: storedatatodynamodb.zip
+
+  StoreToDynamoLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt StoreToDynamoLambda.Arn
+      Action: "lambda:InvokeFunction"
+      Principal: "sqs.amazonaws.com"
+      SourceArn: !GetAtt StoreQueue.Arn
+
+  StoreToDynamoLambdaEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 10
+      EventSourceArn: !GetAtt StoreQueue.Arn
+      FunctionName: !GetAtt StoreToDynamoLambda.Arn
+      Enabled: true
+
+  # Lambda function to fetch the reservation by the email of the user
+  FetchByEmailLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: FetchByEmailLambda
+      Runtime: nodejs20.x  
+      Role: arn:aws:iam::970200206506:role/LabRole
+      Handler: index.handler
+      Code:
+        S3Bucket: storedataindynamodb
+        S3Key: fetchingbyemail.zip
+      
+
+  FetchByEmailLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt FetchByEmailLambda.Arn
+      Action: "lambda:InvokeFunction"
+      Principal: "apigateway.amazonaws.com"
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestaurantApi}/*/POST/bookings"
+
+  FetchByEmailIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref RestaurantApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt FetchByEmailLambda.Arn
+      PayloadFormatVersion: "2.0"
+      IntegrationMethod: POST
+
+  FetchByEmailRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref RestaurantApi
+      RouteKey: "POST /bookings"
+      Target: !Sub "integrations/${FetchByEmailIntegration}"
+
+
+
+  # SNS Topic for reservation notifications
+  ReservationSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: RestaurantReservationSNSTopic
+
+
+  EC2Instance:
+    Type: "AWS::EC2::Instance"
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: ami-0ba9883b710b05ac6
+      KeyName: term
+      SecurityGroups:
+        - !Ref InstanceSecurityGroup
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          yum update -y
+          yum install -y docker
+          service docker start
+          usermod -a -G docker ec2-user
+          docker pull bhavya1712/term-assignment-frontend
+          docker run -p 3000:3000 -d bhavya1712/term-assignment-frontend
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable SSH and TCP/3000 access
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          CidrIp: 0.0.0.0/0
+
+Outputs:
+  ApiEndpoint:
+    Description: "API endpoint URL for Restaurant application"
+    Value: !Sub "https://${RestaurantApi}.execute-api.${AWS::Region}.amazonaws.com"
+
+  QueueUrl:
+    Description: "The URL of the SQS queue for restaurant reservations."
+    Value: !Ref ReservationQueue
+
+  SecondQueueUrl:
+    Description: "For Storing to the DynamoDB database"
+    Value: !Ref StoreQueue
+
+  SNSTopicArn:
+    Description: "The ARN of the SNS topic for restaurant reservation notifications."
+    Value: !Ref ReservationSNSTopic
+
+  InstanceId:
+    Description: Instance ID of the newly created EC2 instance
+    Value: !Ref EC2Instance
+  PublicIP:
+    Description: Public IP address of the newly created EC2 instance
+    Value: !GetAtt EC2Instance.PublicIp
